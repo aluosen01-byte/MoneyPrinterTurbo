@@ -24,6 +24,8 @@ import threading
 import time
 import uuid
 
+from loguru import logger as _logger
+
 from app.models.schema import MaterialInfo, VideoParams
 from app.services import state as sm
 from app.services import task
@@ -31,6 +33,11 @@ from app.utils import utils
 
 
 def main():
+    # 收紧 MPT 日志（必须在导入 app.config 之后执行，覆盖其已添加的 handler）：
+    # 只保留 WARNING+，纯消息格式（无时间戳/ANSI），避免噪音刷屏与重复行
+    _logger.remove()
+    _logger.add(sys.stdout, level="WARNING", format="{message}", colorize=False)
+
     job = json.load(open(sys.argv[1], encoding="utf-8"))
     name = str(job.get("name") or "video").strip() or "video"
     script = str(job.get("script") or "").strip()
