@@ -43,6 +43,8 @@ def main():
     script = str(job.get("script") or "").strip()
     clip_duration = max(2, int(job.get("clip_duration", 5)))
     voice = str(job.get("voice") or "en-US-AriaNeural").strip()
+    aspect = str(job.get("aspect") or "9:16").strip() or "9:16"
+    subtitle_enabled = bool(job.get("subtitle_enabled", True))
 
     # 1) 复制素材到 MPT 本地素材目录（preprocess_video 只允许读取该目录内文件）
     local_dir = utils.storage_dir("local_videos", create=True)
@@ -70,14 +72,14 @@ def main():
     params = VideoParams(
         video_subject=name,
         video_script=script,
-        video_aspect="9:16",
+        video_aspect=aspect,
         video_concat_mode="sequential",
         video_clip_duration=clip_duration,
         video_source="local",
         video_materials=materials,
         voice_name=voice,
         voice_rate=1.0,
-        subtitle_enabled=True,
+        subtitle_enabled=subtitle_enabled,
         bgm_type="none",
         bgm_volume=0,
         n_threads=2,
