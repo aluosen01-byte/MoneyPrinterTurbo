@@ -59,6 +59,9 @@ from app.services import version_checker
 from app.utils.logging_utils import configure_terminal_logger
 from app.utils import utils
 
+# 本地图片素材的路径识别与收集（参考 SenluoFlow 的工作目录识别方式）。
+from webui import local_image_materials as lim
+
 st.set_page_config(
     page_title="MoneyPrinterTurbo",
     page_icon="🤖",
@@ -1231,6 +1234,8 @@ def _apply_pending_task_restore():
     # 历史任务只保存素材路径，不能保证这些文件在当前环境仍然存在。
     # 同时清空当前页面已缓存的上传素材，避免恢复后误用另一个任务的文件。
     st.session_state["local_video_materials"] = []
+    st.session_state.pop("local_image_materials", None)
+    st.session_state.pop("local_image_recognition", None)
     st.session_state.pop("custom_audio_file_uploader", None)
     st.session_state.pop("custom_bgm_uploader", None)
     st.session_state.pop("custom_bgm_validation", None)
@@ -3227,6 +3232,195 @@ def _render_script_settings(panel, params):
             )
 
 
+def _render_local_image_folder_materials():
+    """本地图片素材入口：粘贴目录 → 识别路径 → 勾选产品 → 加载为素材（支持批量）。
+
+    参考 SenluoFlow 的路径识别：输入一个基础目录，自动识别其中含图片的产品目录；
+    也可以直接输入单个产品目录。识别结果保存在会话状态中，生成时按产品逐个提交任务。
+    """
+    with st.expander(tr("Local Image Folder Materials"), expanded=False):
+        st.caption(tr("Local Image Folder Help"))
+        folder_path = st.text_input(
+            tr("Image Folder Path"),
+            key="local_image_dir_input",
+            placeholder="D:\\跨境电商\\产品图片合集21竹蜻蜓小蓝鸭",
+        )
+        include_userguide = st.checkbox(
+            tr("Include User Guide Images"),
+            value=False,
+            key="local_image_include_userguide",
+        )
+        max_images = st.selectbox(
+            tr("Max Images Per Product"),
+            options=[10, 20, 30, 50, 0],
+            format_func=lambda value: tr("No Limit") if value == 0 else f"{value}",
+            key="local_image_max_images",
+        )
+        if st.button(tr("Recognize Path"), key="local_image_recognize_btn"):
+            if not folder_path or not os.path.isdir(folder_path):
+                st.error(tr("Image Folder Path Not Found"))
+            else:
+                products = lim.recognize_products(
+                    folder_path,
+                    include_userguide=include_userguide,
+                    max_images=int(max_images or 0),
+                )
+                st.session_state["local_image_recognition"] = products
+                if not products:
+                    st.warning(tr("No Images Found in Path"))
+
+        products = st.session_state.get("local_image_recognition") or []
+        if products:
+            st.write(tr("Recognized Products Count").format(n=len(products)))
+            product_options = [
+                f"{product['name']}（{product['image_count']} 张）"
+                for product in products
+            ]
+            selected_labels = st.multiselect(
+                tr("Select Products"),
+                options=product_options,
+                default=product_options,
+                key="local_image_selected_products",
+            )
+            selected = [
+                product
+                for product in products
+                if f"{product['name']}（{product['image_count']} 张）"
+                in selected_labels
+            ]
+            if selected:
+                preview_product = selected[0]
+                preview_images = preview_product["images"][:6]
+                st.caption(
+                    f"{tr('Preview')}: {preview_product['name']}"
+                )
+                if preview_images:
+                    preview_columns = st.columns(len(preview_images))
+                    for column, image_path in zip(preview_columns, preview_images):
+                        column.image(image_path, width=90)
+            load_column, clear_column = st.columns(2)
+            if load_column.button(
+                tr("Load Selected as Materials"),
+                key="local_image_load_btn",
+                use_container_width=True,
+            ):
+                loaded = [
+                    {
+                        "name": product["name"],
+                        "path": product["path"],
+                        "images": product["images"],
+                    }
+                    for product in selected
+                ]
+                if loaded:
+                    st.session_state["local_image_materials"] = loaded
+                    # 与浏览器上传的旧素材互斥：加载图片素材后，本次生成不再复用旧上传。
+                    st.session_state.pop("local_video_materials", None)
+                    st.success(tr("Image Materials Loaded").format(n=len(loaded)))
+                else:
+                    st.warning(tr("No Products Selected"))
+            if clear_column.button(
+                tr("Clear Image Materials"),
+                key="local_image_clear_btn",
+                use_container_width=True,
+            ):
+                st.session_state.pop("local_image_materials", None)
+                st.session_state.pop("local_image_recognition", None)
+                st.success(tr("Image Materials Cleared"))
+
+        loaded = st.session_state.get("local_image_materials") or []
+        if loaded:
+            st.caption(tr("Loaded Image Materials Summary").format(n=len(loaded)))
+            for item in loaded:
+                st.write(f"- {item['name']}（{len(item['images'])} 张）")
+
+
+def _submit_folder_material_batch(params, folder_materials):
+    """为加载的产品目录批量提交视频生成任务：一个产品一条任务。
+
+    图片会复制到 storage/local_videos 专用素材目录，沿用 WebUI 现有的本地素材
+    安全边界（preprocess_video 只接受该目录内的路径）。任务在队列中逐个执行。
+    """
+    local_videos_dir = utils.storage_dir("local_videos", create=True)
+    submitted = []
+    base_subject = (params.video_subject or "").strip()
+    base_script = (params.video_script or "").strip()
+    # 批量模式未填写文案时使用通用英文促销文案，避免依赖未配置的 LLM。
+    fallback_script = (
+        "Meet this amazing new product! It is designed with quality and "
+        "attention to detail, and it is sure to bring joy and convenience to "
+        "your everyday life. Lightweight, durable, and easy to use, it makes "
+        "a perfect gift for friends and family. Order yours today and see "
+        "the difference for yourself!"
+    )
+    for item in folder_materials:
+        product_name = str(item.get("name") or "").strip()
+        task_params = params.model_copy(deep=True)
+        # 用户没有填写主题时，用产品目录名作为任务主题，方便在任务列表中识别。
+        if not base_subject and product_name:
+            task_params.video_subject = product_name
+        if not base_script:
+            task_params.video_script = fallback_script
+
+        task_params.video_materials = []
+        imported_count = 0
+        for image_path in item.get("images") or []:
+            extension = os.path.splitext(image_path)[1].lower()
+            if extension not in lim.IMAGE_EXTENSIONS:
+                continue
+            if not os.path.isfile(image_path):
+                continue
+            target_path = os.path.join(
+                local_videos_dir,
+                f"folder-material-{uuid4().hex}{extension}",
+            )
+            try:
+                shutil.copy2(image_path, target_path)
+            except OSError as exc:
+                logger.warning(
+                    f"skip importing local image material: {image_path}, error: {exc}"
+                )
+                continue
+            material = MaterialInfo()
+            material.provider = "local"
+            material.url = target_path
+            task_params.video_materials.append(material)
+            imported_count += 1
+
+        if not task_params.video_materials:
+            logger.warning(
+                f"skip batch task without importable images: {product_name or item.get('path')}"
+            )
+            continue
+
+        task_id = str(uuid4())
+        _add_active_generation_task(
+            task_id,
+            subject=task_params.video_subject
+            or task_params.video_script
+            or task_id,
+        )
+        # 成片复制到产品目录的 output_video（与 input 同级）；目录不存在时自动创建。
+        product_dir = str(item.get("path") or "").strip()
+        output_dir = (
+            os.path.join(product_dir, "output_video")
+            if os.path.isdir(product_dir)
+            else None
+        )
+        webui_task.submit_generation(
+            task_id=task_id,
+            params=task_params,
+            capture_logs=not config.ui.get("hide_log", False),
+            output_dir=output_dir,
+        )
+        submitted.append(task_id)
+        logger.info(
+            f"WebUI batch folder-material task submitted: task_id={task_id}, "
+            f"product={product_name}, images={imported_count}"
+        )
+    return submitted
+
+
 def _render_video_settings(panel, params):
     """渲染视频设置并返回本次选择的本地素材。"""
     uploaded_files = []
@@ -3271,6 +3465,8 @@ def _render_video_settings(panel, params):
                     accept_multiple_files=True,
                     key="local_video_materials_uploader",
                 )
+                # 图片素材入口：支持粘贴目录路径后识别产品与图片（可批量）。
+                _render_local_image_folder_materials()
 
             # 文案顺序匹配会从关键词生成到最终合成全程保持叙事顺序，因此开启时
             # 顺序拼接是唯一符合实际执行逻辑的选项。同步控件值可避免界面仍显示
@@ -5030,7 +5226,9 @@ def _render_generation_controls(
         "task_restore_upload_requirements", {}
     )
     has_local_materials = bool(
-        uploaded_files or st.session_state.get("local_video_materials", [])
+        uploaded_files
+        or st.session_state.get("local_video_materials", [])
+        or st.session_state.get("local_image_materials", [])
     )
     has_custom_audio = bool(uploaded_audio_file)
     unmet_restore_requirements = _get_unmet_restore_upload_requirements(
@@ -5061,11 +5259,19 @@ def _render_generation_controls(
     if start_button:
         _save_runtime_config()
         task_id = st.session_state.get("pending_generation_task_id") or str(uuid4())
+        folder_materials = st.session_state.get("local_image_materials") or []
+        # 图片素材批量模式：已加载产品目录且没有浏览器上传文件时，允许不填文案，
+        # 由批量提交逻辑为每个产品自动填充通用英文文案。
+        is_folder_batch = (
+            params.video_source == "local"
+            and not uploaded_files
+            and bool(folder_materials)
+        )
         _add_active_generation_task(
             task_id,
             subject=params.video_subject or params.video_script or task_id,
         )
-        if not params.video_subject and not params.video_script:
+        if not params.video_subject and not params.video_script and not is_folder_batch:
             _remove_active_generation_task(task_id)
             st.error(tr("Video Script and Subject Cannot Both Be Empty"))
             st.stop()
@@ -5220,6 +5426,30 @@ def _render_generation_controls(
             with open(custom_audio_path, "wb") as f:
                 f.write(uploaded_audio_file.getbuffer())
             params.custom_audio_file = custom_audio_path
+
+        if is_folder_batch:
+            # 图片素材批量模式：每个产品目录一条任务，全部进入队列依次执行。
+            try:
+                submitted_ids = _submit_folder_material_batch(
+                    params, folder_materials
+                )
+            except Exception:
+                _remove_active_generation_task(task_id)
+                logger.exception("WebUI batch folder-material submission failed")
+                st.error(tr("Video Generation Failed"))
+                st.stop()
+            if not submitted_ids:
+                _remove_active_generation_task(task_id)
+                st.error(tr("Please Upload Local Materials First"))
+                st.stop()
+            st.session_state["current_generation_task_id"] = submitted_ids[-1]
+            st.toast(tr("Batch Tasks Submitted").format(n=len(submitted_ids)))
+            logger.info(
+                f"WebUI folder-material batch submitted: "
+                f"{len(submitted_ids)} tasks"
+            )
+            # 批量分支已提交任务，跳过下方单任务提交逻辑。
+            st.stop()
 
         if uploaded_files:
             local_videos_dir = utils.storage_dir("local_videos", create=True)

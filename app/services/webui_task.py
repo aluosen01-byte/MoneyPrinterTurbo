@@ -1,3 +1,5 @@
+import os
+import shutil
 import threading
 from collections import deque
 
@@ -50,12 +52,44 @@ def get_task_logs(task_id: str) -> list[str]:
         return list(_task_logs.get(task_id, ()))
 
 
+def _copy_final_videos(video_paths, output_dir: str, task_id: str) -> None:
+    """任务成功后把成片复制到指定目录（例如产品目录的 output_video）。
+
+    复制失败只记日志，不改变任务本身的状态。
+    """
+    if not output_dir or not video_paths:
+        return
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except OSError as exc:
+        logger.warning(
+            f"failed to create video output dir: {output_dir}, error: {exc}"
+        )
+        return
+    for video_path in video_paths:
+        if not os.path.isfile(video_path):
+            continue
+        target_path = os.path.join(output_dir, os.path.basename(video_path))
+        try:
+            shutil.copy2(video_path, target_path)
+            logger.info(
+                f"copied final video to output dir: {target_path} "
+                f"(task_id={task_id})"
+            )
+        except OSError as exc:
+            logger.warning(
+                f"failed to copy final video to output dir: {video_path} -> "
+                f"{target_path}, error: {exc}"
+            )
+
+
 def _run_generation(
     task_id: str,
     params: VideoParams,
     capture_logs: bool,
     voice_preview: dict | None = None,
     loomloom_video_request: LoomLoomConfirmedVideoRequest | None = None,
+    output_dir: str | None = None,
 ) -> dict:
     """
     在后台线程中执行现有视频流水线。
@@ -79,12 +113,17 @@ def _run_generation(
         # 完整任务仍使用原来的配置锁，防止另一个 WebUI 会话在生成中途修改
         # Provider、密钥等进程级配置，造成同一条视频前后使用不同设置。
         with config.runtime_config_lock():
-            return tm.start(
+            result = tm.start(
                 task_id=task_id,
                 params=params,
                 voice_preview=voice_preview,
                 loomloom_video_request=loomloom_video_request,
             )
+        # 任务成功生成成片后，按需把成片复制到调用方指定的输出目录
+        # （例如图片素材模式下，产品目录下的 output_video）。
+        if result and result.get("videos"):
+            _copy_final_videos(result["videos"], output_dir, task_id)
+        return result
     except Exception as exc:
         # tm.start 已负责把流水线异常转换成失败状态；这里额外保护日志 sink、
         # 配置锁等 WebUI 包装层。任何后台线程异常都必须留下终态，不能让任务
@@ -125,6 +164,7 @@ def submit_generation(
     capture_logs: bool = True,
     voice_preview: dict | None = None,
     loomloom_video_request: LoomLoomConfirmedVideoRequest | None = None,
+    output_dir: str | None = None,
 ) -> None:
     """
     登记并提交 WebUI 视频生成任务，调用后立即返回。
@@ -153,6 +193,7 @@ def submit_generation(
             capture_logs=capture_logs,
             voice_preview=voice_preview_snapshot,
             loomloom_video_request=loomloom_request_snapshot,
+            output_dir=output_dir,
         )
     except Exception as exc:
         # 调度失败与流水线失败一样必须成为可查询状态，避免任务管理器永久显示
